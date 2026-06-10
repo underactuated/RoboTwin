@@ -100,6 +100,7 @@ def main(task_name=None, task_config=None):
     args["embodiment_name"] = embodiment_name
     args['task_config'] = task_config
     args["save_path"] = os.path.join(args["save_path"], str(args["task_name"]), args["task_config"])
+    args["generate_failures"] = args.get("generate_failures", False)
     run(task, args)
 
 
