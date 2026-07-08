@@ -15,6 +15,7 @@ import transforms3d as t3d
 import yaml
 
 from envs import *
+from script.negative_data import ReplayObjectShifter, record_at_dataset_frames
 
 
 PLANNER_PERTURB = "planner_perturb"
@@ -185,138 +186,6 @@ class ContinuousPerturber:
         task.set_gripper = set_gripper_wrapper
 
 
-class ReplayObjectShifter:
-    def __init__(self, amplitude, seed, max_objects=1):
-        self.amplitude = float(amplitude)
-        self.rng = np.random.default_rng(seed)
-        self.max_objects = max(1, int(max_objects))
-        self.xy_scale = 0.03
-        self.z_scale = 0.0
-        self.events = []
-
-    @property
-    def enabled(self):
-        return self.amplitude > 0
-
-    def normal(self, scale, size=None):
-        return self.rng.normal(0.0, self.amplitude * scale, size=size)
-
-    def apply(self, task):
-        if not self.enabled:
-            return []
-
-        candidates = self.find_candidates(task)
-        if not candidates:
-            return []
-
-        self.rng.shuffle(candidates)
-        shifted = []
-        for path, obj, entity in candidates:
-            if len(shifted) >= self.max_objects:
-                break
-            event = self.shift_entity(path, entity)
-            if event is not None:
-                shifted.append(event)
-
-        settle_steps = int(getattr(task, "replay_shift_settle_steps", 20))
-        for _ in range(settle_steps):
-            task.scene.step()
-        self.events = shifted
-        return shifted
-
-    def find_candidates(self, task):
-        candidates = []
-        seen = set()
-        skip_roots = {
-            "engine", "renderer", "scene", "viewer", "robot", "cameras", "camera",
-            "info", "now_obs", "world_pcd", "cluttered_objs", "record_cluttered_objects",
-            "direction_light_lst", "point_light_lst", "file_path", "prohibited_area",
-        }
-
-        def visit(value, path, depth=0):
-            if depth > 3:
-                return
-            if value is None:
-                return
-            entity = self.unwrap_entity(value)
-            if entity is not None:
-                key = id(entity)
-                if key not in seen and self.is_shiftable_entity(task, path, entity):
-                    seen.add(key)
-                    candidates.append((path, value, entity))
-                return
-            if isinstance(value, (list, tuple)):
-                for idx, item in enumerate(value):
-                    visit(item, f"{path}[{idx}]", depth + 1)
-            elif isinstance(value, dict):
-                for key, item in value.items():
-                    visit(item, f"{path}.{key}", depth + 1)
-
-        for name, value in vars(task).items():
-            if name.startswith("_") or name in skip_roots:
-                continue
-            visit(value, name)
-        return candidates
-
-    @staticmethod
-    def unwrap_entity(value):
-        if hasattr(value, "actor") and hasattr(value.actor, "get_pose") and hasattr(value.actor, "set_pose"):
-            return value.actor
-        if hasattr(value, "get_pose") and hasattr(value, "set_pose"):
-            return value
-        return None
-
-    @staticmethod
-    def is_shiftable_entity(task, path, entity):
-        lowered_path = path.lower()
-        if any(token in lowered_path for token in ("table", "wall", "ground", "camera", "light")):
-            return False
-        if hasattr(task, "robot") and entity.get_name() in getattr(task.robot, "gripper_name", []):
-            return False
-        try:
-            pose = entity.get_pose()
-        except Exception:
-            return False
-        p = np.asarray(pose.p, dtype=np.float64)
-        if not (-0.45 <= p[0] <= 0.45 and -0.35 <= p[1] <= 0.35 and 0.65 <= p[2] <= 1.25):
-            return False
-        return True
-
-    def shift_entity(self, path, entity):
-        pose = entity.get_pose()
-        old_p = np.asarray(pose.p, dtype=np.float64)
-        delta = np.array([
-            self.normal(self.xy_scale),
-            self.normal(self.xy_scale),
-            self.normal(self.z_scale),
-        ], dtype=np.float64)
-
-        # Keep arm-selection branches stable for scripts that choose left/right by x sign.
-        new_x = old_p[0] + delta[0]
-        if old_p[0] != 0 and old_p[0] * new_x < 0:
-            delta[0] = -0.5 * old_p[0]
-
-        new_p = old_p + delta
-        new_p[0] = np.clip(new_p[0], -0.42, 0.42)
-        new_p[1] = np.clip(new_p[1], -0.32, 0.32)
-        new_pose = sapien.Pose(new_p, pose.q)
-        try:
-            entity.set_pose(new_pose)
-        except Exception:
-            return None
-
-        return {
-            "name": "replay_object_shift",
-            "value": {
-                "path": path,
-                "entity_name": entity.get_name(),
-                "old_position": old_p.tolist(),
-                "delta": delta.tolist(),
-                "new_position": new_p.tolist(),
-            },
-        }
-
-
 def prepare_args(
     task_name,
     task_config,
@@ -440,6 +309,10 @@ def collect_plans(task, args, accept_success, target_num=None):
     epid, plan_num, reject_num, seed_list = 0, 0, 0, []
     os.makedirs(args["save_path"], exist_ok=True)
     args["need_plan"] = True
+    # Replay injects loaded paths into the shared args dictionary. A newly
+    # planned source trajectory must always start with empty path lists.
+    args.pop("left_joint_path", None)
+    args.pop("right_joint_path", None)
 
     seed_path = os.path.join(args["save_path"], "seed.txt")
     if os.path.exists(seed_path):
@@ -560,26 +433,67 @@ def prepare_replay_episode(task, args, episode_idx, seed, traj_idx):
             "actual_perturbation_amplitude": actual_amplitude,
             "replay_shift_attempt": args.get("replay_shift_attempt"),
         }
+        if "failure_detector_positive_amplitudes" in args:
+            extra["failure_detector_positive_amplitudes"] = args[
+                "failure_detector_positive_amplitudes"
+            ]
+            extra["failure_detector_target_positive_traces"] = args[
+                "failure_detector_target_positive_traces"
+            ]
+            extra["failure_detector_positive_attempts"] = args[
+                "failure_detector_positive_attempts"
+            ]
     return extra
 
 
-def run_replay_once(task, args, episode_idx, seed, traj_idx, save_data):
+def run_replay_once(
+    task,
+    args,
+    episode_idx,
+    seed,
+    traj_idx,
+    save_data,
+    replay_observer=None,
+):
     args["need_plan"] = False
     args["render_freq"] = 0
     args["save_data"] = save_data
     task.save_data = save_data
     extra = prepare_replay_episode(task, args, episode_idx, seed, traj_idx)
-    info = task.play_once()
+    context = {
+        "episode_idx": episode_idx,
+        "seed": seed,
+        "traj_idx": traj_idx,
+        "save_data": save_data,
+        "actual_amplitude": args.get(
+            "actual_perturbation_amplitude", args["perturbation_amplitude"]
+        ),
+        "replay_attempt": args.get("replay_shift_attempt", 0),
+        "extra": extra,
+    }
+    recorder = (
+        replay_observer.start(task, context)
+        if replay_observer is not None
+        else None
+    )
+    if recorder is None:
+        info = task.play_once()
+    else:
+        with record_at_dataset_frames(task, recorder):
+            info = task.play_once()
     final_success = bool(task.plan_success and task.check_success())
+    if replay_observer is not None:
+        replay_observer.finish(recorder, context, final_success)
     return final_success, info, extra
 
 
-def collect_negative_data(task, args):
+def collect_negative_data(task, args, replay_observer=None):
     if not args["collect_data"]:
         return
 
     print("\033[93m" + "[Start Negative Data Collection]" + "\033[0m")
-    seed_list = load_seed_file(args["save_path"])
+    seed_path = os.path.join(args["save_path"], "seed.txt")
+    seed_list = load_seed_file(args["save_path"]) if os.path.exists(seed_path) else []
     clear_cache_freq = args["clear_cache_freq"]
 
     def exist_hdf5(idx):
@@ -615,22 +529,64 @@ def collect_negative_data(task, args):
         print(f"\033[34mNegative task name: {args['task_name']} seed: {seed}\033[0m")
 
         if args["negative_mode"] == REPLAY_OBJECT_SHIFT:
+            if replay_observer is not None and hasattr(
+                replay_observer, "reset_episode"
+            ):
+                replay_observer.reset_episode(episode_idx)
+
             actual_amplitude = base_amplitude
             replay_attempt = 0
             dry_failure_found = False
+            positive_amplitudes = []
+            target_positives = int(
+                args.get("failure_detector_target_positive_traces", 0)
+            )
 
-            while True:
-                replay_attempt += 1
-                args["actual_perturbation_amplitude"] = actual_amplitude
-                args["replay_shift_attempt"] = replay_attempt
+            if target_positives > 0:
+                args["actual_perturbation_amplitude"] = 0.0
+                args["replay_shift_attempt"] = 0
                 try:
-                    final_success, _, _ = run_replay_once(
+                    baseline_success, _, _ = run_replay_once(
                         task,
                         args,
                         episode_idx=episode_idx,
                         seed=seed,
                         traj_idx=traj_idx,
                         save_data=False,
+                        replay_observer=replay_observer,
+                    )
+                except Exception as e:
+                    baseline_success = False
+                    print(
+                        "unperturbed replay failed to construct "
+                        f"(seed = {seed}, error = {e})"
+                    )
+                task.close_env(clear_cache=False)
+                if not baseline_success:
+                    replay_reject_num += 1
+                    seed_cursor += 1
+                    args.pop("actual_perturbation_amplitude", None)
+                    args.pop("replay_shift_attempt", None)
+                    print(
+                        "source plan rejected because amplitude-0 replay "
+                        f"failed (seed = {seed})"
+                    )
+                    continue
+                positive_amplitudes.append(0.0)
+
+            while True:
+                replay_attempt += 1
+                args["actual_perturbation_amplitude"] = actual_amplitude
+                args["replay_shift_attempt"] = replay_attempt
+                try:
+                    final_success, _, dry_extra = run_replay_once(
+                        task,
+                        args,
+                        episode_idx=episode_idx,
+                        seed=seed,
+                        traj_idx=traj_idx,
+                        save_data=False,
+                        replay_observer=replay_observer,
                     )
                 except Exception as e:
                     task.close_env(clear_cache=False)
@@ -645,10 +601,27 @@ def collect_negative_data(task, args):
                     continue
 
                 task.close_env(clear_cache=False)
+                if replay_attempt == 1:
+                    shift_events = (
+                        dry_extra.get("perturbation_events", [])
+                        if dry_extra
+                        else []
+                    )
+                    if shift_events:
+                        shift = shift_events[0]["value"]
+                        print(
+                            "replay shift target: "
+                            f"{shift['path']} "
+                            f"(entity = {shift['entity_name']}, "
+                            f"base delta = {shift['delta']})"
+                        )
+                    else:
+                        print("replay shift target: none")
                 if not final_success:
                     dry_failure_found = True
                     break
 
+                positive_amplitudes.append(actual_amplitude)
                 replay_reject_num += 1
                 print(
                     f"negative replay still succeeded; escalating shift "
@@ -661,10 +634,118 @@ def collect_negative_data(task, args):
                 seed_cursor += 1
                 args.pop("actual_perturbation_amplitude", None)
                 args.pop("replay_shift_attempt", None)
+                args.pop("failure_detector_positive_amplitudes", None)
+                args.pop("failure_detector_positive_attempts", None)
                 continue
 
-            args["actual_perturbation_amplitude"] = actual_amplitude
-            args["replay_shift_attempt"] = replay_attempt
+            failure_amplitude = actual_amplitude
+            failure_attempt = replay_attempt
+            positive_attempt_budget = int(
+                args.get("failure_detector_positive_attempt_budget", 0)
+            )
+            backoff_factor = float(
+                args.get("failure_detector_backoff_factor", 0.5)
+            )
+            minimum_probe_amplitude = base_amplitude * float(
+                args.get("failure_detector_min_probe_amplitude_ratio", 0.01)
+            )
+            positive_attempts = 0
+            success_bound = (
+                max(positive_amplitudes) if positive_amplitudes else None
+            )
+            failure_bound = failure_amplitude
+
+            while (
+                len(positive_amplitudes) < target_positives
+                and positive_attempts < positive_attempt_budget
+            ):
+                if success_bound is None:
+                    probe_amplitude = failure_bound * backoff_factor
+                else:
+                    probe_amplitude = 0.5 * (
+                        success_bound + failure_bound
+                    )
+                if probe_amplitude <= 0 or np.isclose(
+                    probe_amplitude, failure_bound
+                ):
+                    break
+                if probe_amplitude < minimum_probe_amplitude:
+                    print(
+                        "positive-envelope probing stopped at minimum "
+                        f"amplitude {minimum_probe_amplitude:g}"
+                    )
+                    break
+
+                positive_attempts += 1
+                replay_attempt += 1
+                args["actual_perturbation_amplitude"] = probe_amplitude
+                args["replay_shift_attempt"] = replay_attempt
+                try:
+                    probe_success, _, _ = run_replay_once(
+                        task,
+                        args,
+                        episode_idx=episode_idx,
+                        seed=seed,
+                        traj_idx=traj_idx,
+                        save_data=False,
+                        replay_observer=replay_observer,
+                    )
+                except Exception as e:
+                    task.close_env(clear_cache=False)
+                    failure_bound = probe_amplitude
+                    print(
+                        "positive-envelope probe failed to construct "
+                        f"(amplitude = {probe_amplitude:g}, error = {e})"
+                    )
+                    continue
+
+                task.close_env(clear_cache=False)
+                if probe_success:
+                    positive_amplitudes.append(probe_amplitude)
+                    success_bound = probe_amplitude
+                    print(
+                        "positive-envelope replay accepted "
+                        f"({len(positive_amplitudes)}/{target_positives}, "
+                        f"amplitude = {probe_amplitude:g})"
+                    )
+                else:
+                    failure_bound = probe_amplitude
+                    print(
+                        "positive-envelope probe failed task; reducing upper "
+                        f"bound (amplitude = {probe_amplitude:g})"
+                    )
+
+            args["failure_detector_positive_amplitudes"] = positive_amplitudes
+            args["failure_detector_target_positive_traces"] = target_positives
+            args["failure_detector_positive_attempts"] = positive_attempts
+            args["actual_perturbation_amplitude"] = failure_amplitude
+            args["replay_shift_attempt"] = failure_attempt
+            confidence = (
+                "normal"
+                if len(positive_amplitudes) >= target_positives
+                else "low"
+            )
+            print(
+                "positive envelope summary: "
+                f"{len(positive_amplitudes)}/{target_positives} successful "
+                f"traces, confidence = {confidence}"
+            )
+            minimum_positives = int(
+                args.get("failure_detector_min_positive_traces", 0)
+            )
+            if len(positive_amplitudes) < minimum_positives:
+                replay_reject_num += 1
+                seed_cursor += 1
+                args.pop("actual_perturbation_amplitude", None)
+                args.pop("replay_shift_attempt", None)
+                args.pop("failure_detector_positive_amplitudes", None)
+                args.pop("failure_detector_positive_attempts", None)
+                print(
+                    "failure candidate rejected: only "
+                    f"{len(positive_amplitudes)}/{minimum_positives} minimum "
+                    "positive traces were available"
+                )
+                continue
 
         try:
             final_success, info, extra = run_replay_once(
@@ -674,6 +755,7 @@ def collect_negative_data(task, args):
                 seed=seed,
                 traj_idx=traj_idx,
                 save_data=True,
+                replay_observer=replay_observer,
             )
         except Exception as e:
             task.close_env(clear_cache=False)
@@ -683,6 +765,8 @@ def collect_negative_data(task, args):
                 seed_cursor += 1
                 args.pop("actual_perturbation_amplitude", None)
                 args.pop("replay_shift_attempt", None)
+                args.pop("failure_detector_positive_amplitudes", None)
+                args.pop("failure_detector_positive_attempts", None)
                 print(
                     f"negative replay rejected during recording rerun! "
                     f"(seed = {seed}, episode = {episode_idx}, error = {e})")
@@ -698,6 +782,8 @@ def collect_negative_data(task, args):
                 seed_cursor += 1
                 args.pop("actual_perturbation_amplitude", None)
                 args.pop("replay_shift_attempt", None)
+                args.pop("failure_detector_positive_amplitudes", None)
+                args.pop("failure_detector_positive_attempts", None)
                 print(
                     f"negative replay rejected after recording rerun! "
                     f"(seed = {seed}, episode = {episode_idx}, success = True)")
@@ -707,10 +793,16 @@ def collect_negative_data(task, args):
                 "Try increasing perturbation_amplitude or replay_shift_max_objects.")
         task.merge_pkl_to_hdf5_video()
         task.remove_data_cache()
+        if replay_observer is not None and hasattr(
+            replay_observer, "on_episode_complete"
+        ):
+            replay_observer.on_episode_complete(episode_idx)
         episode_idx += 1
         seed_cursor += 1
         args.pop("actual_perturbation_amplitude", None)
         args.pop("replay_shift_attempt", None)
+        args.pop("failure_detector_positive_amplitudes", None)
+        args.pop("failure_detector_positive_attempts", None)
 
     ensure_negative_task_config(args)
     ensure_scene_info(args)

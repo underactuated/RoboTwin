@@ -18,6 +18,117 @@ Two negative modes are supported:
 
 The default wrapper currently uses `replay_object_shift`.
 
+## Experimental Automatic Failure Detection
+
+There is also a newer experimental collector that builds on
+`replay_object_shift` and estimates the failure onset automatically:
+
+- `collect_negative_data_failure_detection.sh`
+- `script/collect_negative_data_failure_detection.py`
+
+This path is intended for developing and validating failure-aware negative
+datasets. It still saves standard RoboTwin HDF5/video episodes, but it also
+saves replay pose traces and runs a detector that separates mostly-successful
+prefix frames from clearly failed frames.
+
+Example:
+
+```bash
+python script/collect_negative_data_failure_detection.py \
+  hanging_mug my_config \
+  --episode-num 3 \
+  --save-setting my_config_auto_detection \
+  --target-positive-traces 5 \
+  --positive-attempt-budget 20
+```
+
+To also create a combined replay/detection video for each accepted episode:
+
+```bash
+python script/collect_negative_data_failure_detection.py \
+  hanging_mug my_config \
+  --episode-num 3 \
+  --save-setting my_config_auto_detection \
+  --create-detection-video
+```
+
+This experimental collector should normally use a distinct `--save-setting`
+while it is being validated. That avoids mixing test outputs with a final
+training dataset.
+
+### How Automatic Detection Works
+
+For each candidate source plan, the collector:
+
+1. Generates one successful source plan lazily.
+2. Replays it with zero perturbation. If the amplitude-0 replay fails, the
+   source plan is rejected because it is not a reliable baseline.
+3. Selects one shiftable actor and one shift direction, then escalates the
+   replay-object-shift amplitude until the replay fails.
+4. Collects successful replay traces near the success/failure boundary. These
+   traces define the positive envelope.
+5. Records the first failed replay as the negative episode.
+6. Compares movable actor positions in the failed trace against the positive
+   envelope and saves the detected failure onset.
+
+The same selected actor and shift direction are kept during escalation. This
+avoids changing the perturbation source while searching for the failure
+amplitude.
+
+By default, pose traces include shiftable/movable task actors only. For example,
+for `hanging_mug` this usually tracks actors such as `mug` and `rack`, not fixed
+background fixtures like the table or wall. Use `--include-nonshiftable-actors`
+only when debugging actor discovery or scene setup.
+
+The detector currently uses actor position components only (`x`, `y`, `z`):
+
+- successful traces define per-frame mean and standard deviation;
+- the failed trace is converted to normalized actor deviations;
+- an actor is considered divergent when its deviation exceeds a threshold for
+  `--persistence-frames` consecutive frames;
+- the threshold is also adjusted by the early-frame baseline via
+  `--initial-margin`, which prevents harmless initial replay offsets from
+  triggering immediately.
+
+Important detector parameters:
+
+```text
+--std-floor-m 0.005          minimum position std used for normalization
+--threshold-k 3.0            base normalized-deviation threshold
+--warmup-frames 3            early frames used for baseline adjustment
+--initial-margin 1.1         multiplier for early-frame baseline adjustment
+--persistence-frames 3       consecutive threshold crossings required
+```
+
+Important adaptive sampling parameters:
+
+```text
+--target-positive-traces 5       desired successful traces per failure
+--min-positive-traces 3          reject failure if fewer positives are found
+--positive-attempt-budget 20     maximum extra probes around the boundary
+--backoff-factor 0.5             amplitude reduction factor during backoff
+--min-probe-amplitude-ratio 0.01 stop probing below this fraction of base amplitude
+```
+
+Expected console messages include:
+
+```text
+replay shift target: rack (entity = 040_rack, base delta = [...])
+negative replay still succeeded; escalating shift (...)
+positive-envelope replay accepted (5/5, amplitude = ...)
+automatic failure detection: episode = episode_000, onset = 294, actor = mug, confidence = normal
+```
+
+Some rejections are expected:
+
+```text
+source plan rejected because amplitude-0 replay failed
+failure candidate rejected: only 2/3 minimum positive traces were available
+```
+
+These candidates are skipped and should not be saved as accepted negative
+episodes.
+
 ## Basic Usage
 
 The wrapper has the same calling convention as `collect_data.sh`:
@@ -102,6 +213,38 @@ When `--save-setting "$task_config"` is used, `<setting>` is the original config
 
 `scene_info.json` is also written so the existing instruction-generation and packing pipeline can read the dataset normally.
 
+The automatic failure-detection collector additionally writes debug and
+detection outputs:
+
+```text
+data/<task>/<setting>/
+  failure_detection_debug/
+    episode_000/
+      dry_attempt_000_amp0_success.npz
+      dry_attempt_001_amp0.25_success.npz
+      dry_attempt_004_amp2_failure.npz
+      recorded_attempt_004_amp2_failure.npz
+      failure_detection.json
+      failure_detection_stats.npz
+      failure_detection_score.png
+      failure_detection_video.mp4        # only when requested
+```
+
+Each trace `.npz` contains:
+
+- `poses`: array shaped `(frames, actors, 7)` storing
+  `[x, y, z, qw, qx, qy, qz]`;
+- `actor_keys`: actor names in the same order as the second `poses` dimension;
+- `final_success`: whether that replay succeeded;
+- replay metadata such as amplitude, attempt, and seed.
+
+`failure_detection.json` is the compact summary to inspect first. It includes
+the positive traces used, failed trace, actor thresholds, detected onset frame,
+dominant actor at onset, score at onset, and confidence level.
+
+`failure_detection_stats.npz` stores the full time-series data used by the
+plots and detection video.
+
 ## LMDB Conversion Compatibility
 
 The RoboOrchard `robotwin_packer.py` validates directories by exact config name. If the packer is called with:
@@ -143,6 +286,86 @@ In `replay_object_shift`, not every shifted replay fails. The collector may reje
 
 Successful rejects are fast because they use dry replay without image/cache saving. Only accepted failures are replayed with `save_data=True` and merged into HDF5/video.
 
+In the automatic failure-detection collector, amplitude-0 replay failure is a
+special rejection. It means the supposedly successful source plan did not replay
+cleanly even without object shifting. The collector rejects that source seed and
+tries another one, because such a trace cannot define a trustworthy
+success/failure boundary.
+
+## Trace Visualization and Offline Analysis
+
+Pose traces can be plotted independently from collection:
+
+```bash
+python script/visualize_pose_traces.py \
+  data/hanging_mug/my_config_auto_detection/failure_detection_debug/episode_000 \
+  --actors mug rack \
+  --components x y z \
+  --aggregate-positives
+```
+
+By default this saves:
+
+```text
+<trace_dir>/pose_traces.png
+```
+
+Useful options:
+
+```text
+--actors mug rack                 plot only selected actors
+--components x y z                plot only selected pose components
+--aggregate-positives             show successful traces as mean ± std
+--run-kinds dry recorded          include dry and recorded traces
+--output /path/to/figure.png      choose output path
+```
+
+Failure detection can also be rerun offline on an existing trace directory:
+
+```bash
+python script/analyze_replay_failure_detection.py \
+  data/hanging_mug/my_config_auto_detection/failure_detection_debug/episode_000
+```
+
+This rewrites:
+
+```text
+failure_detection.json
+failure_detection_stats.npz
+failure_detection_score.png
+```
+
+You can override detector parameters when rerunning:
+
+```bash
+python script/analyze_replay_failure_detection.py \
+  data/hanging_mug/my_config_auto_detection/failure_detection_debug/episode_000 \
+  --threshold-k 3.0 \
+  --persistence-frames 3
+```
+
+To create the combined replay/detection video after collection:
+
+```bash
+python script/create_failure_detection_video.py \
+  data/hanging_mug/my_config_auto_detection \
+  --episode 0
+```
+
+Default output:
+
+```text
+data/hanging_mug/my_config_auto_detection/failure_detection_debug/episode_000/failure_detection_video.mp4
+```
+
+The video uses the normal episode replay video on top and a threshold-ratio
+strip below it. The strip shows the current frame cursor, threshold line,
+detected onset frame, post-onset shading, current score, and actor with the
+largest normalized deviation.
+
+`matplotlib` is required for static plots. `opencv-python`/`cv2` is required for
+combined videos.
+
 ## Implementation Summary
 
 `planner_perturb` wraps shared task primitives at runtime:
@@ -156,3 +379,8 @@ Successful rejects are fast because they use dry replay without image/cache savi
 `replay_object_shift` scans task attributes for actor-like objects, randomly selects movable candidates, shifts up to `replay_shift_max_objects` objects, and replays the original successful joint path.
 
 The actor selection is intentionally generic. It does not currently distinguish manipulated objects from target/fixture objects; it filters obvious non-task objects such as robot, scene, cameras, table, wall, ground, and objects outside the table workspace.
+
+The automatic failure-detection collector reuses the same replay-shift machinery
+but records actor poses at the dataset frame cadence during dry and recorded
+replays. It then compares the failed replay against successful boundary traces
+for all tracked movable actors, instead of requiring a manually selected actor.
