@@ -156,6 +156,184 @@ python script/collect_negative_data.py "$task_name" "$task_config" \
 
 `--save-setting "$task_config"` makes the negative data save under `data/<task>/<task_config>/`, matching the directory name expected by downstream RobotWin-to-LMDB conversion scripts that pass `--config_name <task_config>`.
 
+## Multi-GPU Batch Launcher
+
+For larger negative-data generation runs, use:
+
+- `script/launch_negative_data_multi_gpu.py`
+
+This is a thin scheduler around `script/collect_negative_data.py`. It does not
+implement a new collector. Instead, it launches multiple independent collector
+subprocesses and assigns at most one subprocess to each selected GPU by setting
+`CUDA_VISIBLE_DEVICES`.
+
+The launcher is useful when generating negative samples for multiple RoboTwin
+tasks. Each task is written to its own output directory:
+
+```text
+<output_root>/<task>/<save_setting>/
+```
+
+Do not use multiple concurrent processes writing to the same
+`<output_root>/<task>/<save_setting>/` directory. The collector does not use
+file locks for `seed.txt`, `negative_info.json`, episode indices, or videos.
+
+### Editable Defaults
+
+Common defaults are intentionally hardcoded near the top of
+`script/launch_negative_data_multi_gpu.py`:
+
+```python
+DEFAULT_TASKS = [
+    "hanging_mug",
+]
+DEFAULT_TASK_CONFIG = "my_config"
+DEFAULT_EPISODES_PER_TASK = 30
+DEFAULT_OUTPUT_ROOT = "./data"
+DEFAULT_MAX_GPUS = 1
+DEFAULT_GPU_IDS = None
+
+DEFAULT_NEGATIVE_MODE = "replay_object_shift"
+DEFAULT_PERTURBATION_AMPLITUDE = 0.25
+DEFAULT_REPLAY_SHIFT_GROWTH_FACTOR = 2.0
+DEFAULT_REPLAY_SHIFT_MAX_AMPLITUDE = 8.0
+```
+
+For routine use, edit these values directly. CLI flags can override them for a
+single run.
+
+### Dry Run
+
+Always start with a dry run:
+
+```bash
+python script/launch_negative_data_multi_gpu.py \
+  --dry-run \
+  --tasks hanging_mug beat_block_hammer \
+  --episodes-per-task 20 \
+  --output-root /data/sergey/robotwin_negative_runs \
+  --max-gpus 2
+```
+
+The dry run prints:
+
+- selected GPUs;
+- generated per-task config names;
+- output directories;
+- log paths;
+- exact collector commands.
+
+Dry run does not launch collection jobs and does not write the temporary
+per-job task config files.
+
+### Launch a Batch
+
+Example using GPUs `0` and `1`:
+
+```bash
+python script/launch_negative_data_multi_gpu.py \
+  --tasks hanging_mug beat_block_hammer \
+  --episodes-per-task 20 \
+  --output-root /data/sergey/robotwin_negative_runs \
+  --max-gpus 2
+```
+
+Example with explicit GPU ids:
+
+```bash
+python script/launch_negative_data_multi_gpu.py \
+  --tasks hanging_mug beat_block_hammer \
+  --episodes-per-task 20 \
+  --output-root /data/sergey/robotwin_negative_runs \
+  --gpus 0 2
+```
+
+The launcher keeps a queue of tasks. When one subprocess exits, that GPU is
+assigned the next pending task.
+
+Logs are saved under:
+
+```text
+logs/negative_collection/
+```
+
+### Output Root and Temporary Configs
+
+`collect_negative_data.py` reads `episode_num` and `save_path` from the task
+YAML config. To avoid modifying your base config, the launcher creates one
+temporary config per job under `task_config/`, overriding only:
+
+```yaml
+episode_num: <episodes_per_task>
+save_path: <output_root>
+```
+
+The generated config names look like:
+
+```text
+task_config/negative_batch_<run_id>_<base_config>_<task>.yml
+```
+
+By default these generated configs are kept, because they make it easier to
+inspect or reproduce a generated dataset. To remove them automatically after
+successful jobs, pass:
+
+```bash
+--cleanup-job-configs
+```
+
+### Save Setting Names
+
+By default, each task writes to a save-setting name based on:
+
+```text
+{config}_negative_{mode}_amp{amplitude}
+```
+
+For example:
+
+```text
+/data/sergey/robotwin_negative_runs/hanging_mug/my_config_negative_replay_object_shift_amp0.25/
+```
+
+You can override the naming pattern:
+
+```bash
+python script/launch_negative_data_multi_gpu.py \
+  --tasks hanging_mug beat_block_hammer \
+  --save-setting-template "{config}_negative_batch_{run_id}" \
+  --output-root /data/sergey/robotwin_negative_runs \
+  --max-gpus 2
+```
+
+Available template fields:
+
+```text
+{task}
+{config}
+{mode}
+{amplitude}
+{run_id}
+```
+
+### Negative-Generation Parameters
+
+The launcher forwards these parameters to `collect_negative_data.py`:
+
+```bash
+--negative-mode replay_object_shift
+--perturbation-amplitude 0.25
+--replay-shift-growth-factor 2.0
+--replay-shift-max-amplitude 8.0
+```
+
+These can be changed either in the editable defaults block or with CLI flags.
+
+Current limitation: this launcher targets the regular negative collector,
+`script/collect_negative_data.py`. It does not currently launch the experimental
+automatic failure-detection collector,
+`script/collect_negative_data_failure_detection.py`.
+
 ## Perturbation Amplitude
 
 `--perturbation-amplitude` is the base perturbation strength. In `replay_object_shift`, object shifts are roughly:
