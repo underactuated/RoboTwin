@@ -306,7 +306,8 @@ def ensure_scene_info(args):
 
 def collect_plans(task, args, accept_success, target_num=None):
     target_num = args["episode_num"] if target_num is None else target_num
-    epid, plan_num, reject_num, seed_list = 0, 0, 0, []
+    seed_start = int(args.get("seed_start", 0))
+    epid, plan_num, reject_num, seed_list = seed_start, 0, 0, []
     os.makedirs(args["save_path"], exist_ok=True)
     args["need_plan"] = True
     # Replay injects loaded paths into the shared args dictionary. A newly
@@ -820,6 +821,7 @@ def main(
     replay_shift_growth_factor=None,
     replay_shift_max_amplitude=None,
     save_setting=None,
+    seed_start=None,
 ):
     task = class_decorator(task_name)
     args = prepare_args(
@@ -831,6 +833,8 @@ def main(
         replay_shift_max_amplitude=replay_shift_max_amplitude,
         save_setting=save_setting,
     )
+    if seed_start is not None:
+        args["seed_start"] = int(seed_start)
     print("============= Negative Collection Config =============\n")
     print("\033[95mNegative Mode:\033[0m " + str(args["negative_mode"]))
     print("\033[95mPerturbation Amplitude:\033[0m " + str(args["perturbation_amplitude"]))
@@ -891,6 +895,12 @@ if __name__ == "__main__":
         default=None,
         help="Override output config directory name under data/<task>. Use the original config name for packer compatibility.",
     )
+    parser.add_argument(
+        "--seed-start",
+        type=int,
+        default=None,
+        help="First simulator seed to try when creating new source plans.",
+    )
     parsed = parser.parse_args()
     if parsed.perturbation_amplitude is not None and parsed.perturbation_amplitude < 0:
         raise ValueError("perturbation-amplitude must be non-negative")
@@ -902,4 +912,5 @@ if __name__ == "__main__":
         replay_shift_growth_factor=parsed.replay_shift_growth_factor,
         replay_shift_max_amplitude=parsed.replay_shift_max_amplitude,
         save_setting=parsed.save_setting,
+        seed_start=parsed.seed_start,
     )

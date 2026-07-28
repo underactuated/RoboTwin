@@ -156,6 +156,29 @@ python script/collect_negative_data.py "$task_name" "$task_config" \
 
 `--save-setting "$task_config"` makes the negative data save under `data/<task>/<task_config>/`, matching the directory name expected by downstream RobotWin-to-LMDB conversion scripts that pass `--config_name <task_config>`.
 
+Episode ids and simulator seeds are related but not identical. Files such as
+`data/episode0.hdf5` and `video/episode0.mp4` use the accepted output episode
+index. `seed.txt` stores the simulator seeds used to create source plans. In a
+simple run with no rejected plans, these may both look like `0, 1, 2, ...`, but
+they diverge as soon as any seed is rejected. The authoritative seed for an
+episode is stored in `negative_info.json` under that episode record.
+
+To start a run from a different simulator seed range:
+
+```bash
+python script/collect_negative_data.py hanging_mug my_config \
+  --negative-mode replay_object_shift \
+  --perturbation-amplitude 0.25 \
+  --replay-shift-growth-factor 2.0 \
+  --replay-shift-max-amplitude 8.0 \
+  --save-setting my_config_negative_seed10000 \
+  --seed-start 10000
+```
+
+If `seed.txt` already exists in the output directory, the collector resumes from
+the last saved seed plus one. For a genuinely new seed range, use a new
+`--save-setting` or remove the old output directory intentionally.
+
 ## Multi-GPU Batch Launcher
 
 For larger negative-data generation runs, use:
@@ -192,6 +215,8 @@ DEFAULT_EPISODES_PER_TASK = 30
 DEFAULT_OUTPUT_ROOT = "./data"
 DEFAULT_MAX_GPUS = 1
 DEFAULT_GPU_IDS = None
+DEFAULT_SEED_START = 0
+DEFAULT_SEED_STRIDE_PER_TASK = 0
 
 DEFAULT_NEGATIVE_MODE = "replay_object_shift"
 DEFAULT_PERTURBATION_AMPLITUDE = 0.25
@@ -235,6 +260,8 @@ python script/launch_negative_data_multi_gpu.py \
   --tasks hanging_mug beat_block_hammer \
   --episodes-per-task 20 \
   --output-root /data/sergey/robotwin_negative_runs \
+  --seed-start 10000 \
+  --seed-stride-per-task 1000 \
   --max-gpus 2
 ```
 
@@ -245,6 +272,7 @@ python script/launch_negative_data_multi_gpu.py \
   --tasks hanging_mug beat_block_hammer \
   --episodes-per-task 20 \
   --output-root /data/sergey/robotwin_negative_runs \
+  --seed-start 10000 \
   --gpus 0 2
 ```
 
@@ -256,6 +284,50 @@ Logs are saved under:
 ```text
 logs/negative_collection/
 ```
+
+### Seed Ranges
+
+The launcher forwards `--seed-start` to each `collect_negative_data.py`
+subprocess. Use this when generating another batch and you want a different
+simulator seed range:
+
+```bash
+python script/launch_negative_data_multi_gpu.py \
+  --tasks hanging_mug beat_block_hammer \
+  --episodes-per-task 20 \
+  --output-root /data/sergey/robotwin_negative_runs \
+  --seed-start 10000 \
+  --max-gpus 2
+```
+
+If all tasks can reuse the same numeric seed range independently, leave
+`--seed-stride-per-task` at `0`. This is usually fine because different tasks
+write separate datasets and seed `10000` for `hanging_mug` is not the same
+sample as seed `10000` for `beat_block_hammer`.
+
+If you want globally non-overlapping numeric seed ranges across tasks, use a
+stride larger than the expected number of tried seeds per task:
+
+```bash
+python script/launch_negative_data_multi_gpu.py \
+  --tasks hanging_mug beat_block_hammer place_empty_cup \
+  --episodes-per-task 100 \
+  --seed-start 10000 \
+  --seed-stride-per-task 10000 \
+  --max-gpus 3
+```
+
+This assigns starts like:
+
+```text
+hanging_mug       -> 10000
+beat_block_hammer -> 20000
+place_empty_cup   -> 30000
+```
+
+Use a new `--save-setting-template` or a new `--output-root` for separate
+batches. If a previous output directory already has `seed.txt`, the collector
+resumes from that file instead of starting over from `--seed-start`.
 
 ### Output Root and Temporary Configs
 
