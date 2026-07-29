@@ -285,6 +285,21 @@ Logs are saved under:
 logs/negative_collection/
 ```
 
+By default, subprocess output is written to those log files only. To also print
+collector output live in the launcher terminal, use:
+
+```bash
+python script/launch_negative_data_multi_gpu.py \
+  --tasks hanging_mug beat_block_hammer \
+  --episodes-per-task 20 \
+  --output-root /data/sergey/robotwin_negative_runs \
+  --max-gpus 2 \
+  --stream-logs
+```
+
+Live lines are prefixed by GPU and task name while still being saved to the
+per-task log files.
+
 ### Seed Ranges
 
 The launcher forwards `--seed-start` to each `collect_negative_data.py`

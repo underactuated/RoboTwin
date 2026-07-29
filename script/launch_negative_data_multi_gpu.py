@@ -14,6 +14,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -51,6 +52,7 @@ DEFAULT_SAVE_SETTING_TEMPLATE = "{config}_negative_{mode}_amp{amplitude}"
 DEFAULT_LOG_DIR = "logs/negative_collection"
 DEFAULT_POLL_SECONDS = 10.0
 DEFAULT_KEEP_JOB_CONFIGS = True
+DEFAULT_STREAM_LOGS = False
 DEFAULT_RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
@@ -76,6 +78,7 @@ class RunningJob:
     gpu_id: int
     process: subprocess.Popen
     log_file: object
+    log_thread: threading.Thread | None = None
 
 
 def sanitize_name(value: str) -> str:
@@ -197,6 +200,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         default=not DEFAULT_KEEP_JOB_CONFIGS,
         help="Remove generated per-job task_config YAMLs after successful jobs.",
+    )
+    parser.add_argument(
+        "--stream-logs",
+        action="store_true",
+        default=DEFAULT_STREAM_LOGS,
+        help="Print subprocess output live while also writing per-task logs.",
     )
     return parser.parse_args()
 
@@ -368,6 +377,19 @@ def build_jobs(args: argparse.Namespace, *, write_configs: bool) -> list[Job]:
     return jobs
 
 
+def stream_process_output(
+    *,
+    process: subprocess.Popen,
+    log_file,
+    prefix: str,
+) -> None:
+    assert process.stdout is not None
+    for line in process.stdout:
+        log_file.write(line)
+        log_file.flush()
+        print(f"{prefix} {line}", end="", flush=True)
+
+
 def launch_job(args: argparse.Namespace, job: Job, gpu_id: int) -> RunningJob:
     command = make_command(args, job)
     env = os.environ.copy()
@@ -378,19 +400,46 @@ def launch_job(args: argparse.Namespace, job: Job, gpu_id: int) -> RunningJob:
     log_file.write(f"CUDA_VISIBLE_DEVICES={gpu_id}\n")
     log_file.flush()
 
-    process = subprocess.Popen(
-        command,
-        env=env,
-        stdout=log_file,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
+    if args.stream_logs:
+        process = subprocess.Popen(
+            command,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        log_thread = threading.Thread(
+            target=stream_process_output,
+            kwargs={
+                "process": process,
+                "log_file": log_file,
+                "prefix": f"[gpu{gpu_id}:{job.task}]",
+            },
+            daemon=True,
+        )
+        log_thread.start()
+    else:
+        process = subprocess.Popen(
+            command,
+            env=env,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        log_thread = None
     print(
         f"Started task={job.task} gpu={gpu_id} "
         f"save={job.output_root / job.task / job.save_setting} "
         f"log={job.log_path}"
     )
-    return RunningJob(job=job, gpu_id=gpu_id, process=process, log_file=log_file)
+    return RunningJob(
+        job=job,
+        gpu_id=gpu_id,
+        process=process,
+        log_file=log_file,
+        log_thread=log_thread,
+    )
 
 
 def cleanup_job_config(job: Job) -> None:
@@ -419,6 +468,8 @@ def run_scheduler(args: argparse.Namespace, jobs: list[Job], gpus: list[int]) ->
             if return_code is None:
                 continue
 
+            if state.log_thread is not None:
+                state.log_thread.join(timeout=5)
             state.log_file.close()
             if return_code == 0:
                 print(f"Finished task={state.job.task} gpu={gpu_id}")

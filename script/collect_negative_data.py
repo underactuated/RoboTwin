@@ -324,7 +324,8 @@ def collect_plans(task, args, accept_success, target_num=None):
         print(f"Exist seed file, Start from: {epid} / {plan_num}")
 
     max_tries = int(args.get("negative_max_tries", max(target_num, args["episode_num"]) * 50))
-    while plan_num < target_num and epid < max_tries:
+    max_seed = seed_start + max_tries
+    while plan_num < target_num and epid < max_seed:
         perturber = None
         try:
             task.setup_demo(now_ep_num=plan_num, seed=epid, **args)
@@ -375,10 +376,14 @@ def collect_plans(task, args, accept_success, target_num=None):
         write_seed_file(args["save_path"], seed_list)
 
     if plan_num < target_num:
+        tried_num = epid - seed_start
         raise RuntimeError(
-            f"Only collected {plan_num} plans after {epid} tries. "
+            f"Only collected {plan_num} plans after {tried_num} tries. "
             f"Try increasing perturbation_amplitude or negative_max_tries.")
-    print(f"\nComplete planning, rejected {reject_num} times / {epid} tries\n")
+    print(
+        f"\nComplete planning, rejected {reject_num} times / "
+        f"{epid - seed_start} tries\n"
+    )
 
 
 def save_negative_metadata(args, episode_idx, seed, final_success, perturber, info, extra=None):
